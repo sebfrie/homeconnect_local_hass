@@ -12,7 +12,7 @@ from custom_components.homeconnect_ws import coordinator as coordinator_module
 from custom_components.homeconnect_ws.const import DOMAIN, LAST_FINISHED_VALUES
 from custom_components.homeconnect_ws.entity_descriptions import get_available_entities
 from custom_components.homeconnect_ws.entity_descriptions.common import generate_last_finished
-from home_disconnect import ConnectionState
+from home_disconnect import ConnectionState, DisconnectedError
 from home_disconnect.entities import Access, DeviceDescription, EntityDescription
 from home_disconnect.testutils import MockAppliance
 from homeassistant.components.sensor import SensorDeviceClass
@@ -27,6 +27,7 @@ from .const import DEVICE_DESCRIPTION, MOCK_APPLIANCE_INFO, MOCK_CONFIG_DATA
 if TYPE_CHECKING:
     import pytest
     from custom_components.homeconnect_ws import HCConfigEntry
+    from custom_components.homeconnect_ws.coordinator import HomeConnectCoordinator
     from freezegun.api import FrozenDateTimeFactory
     from homeassistant.core import HomeAssistant
 
@@ -220,16 +221,14 @@ async def test_state_at_startup_is_not_a_finish(
     assert hass.states.get(entity_id).state == (T0 + timedelta(hours=1)).isoformat()
 
 
-async def _connect_washer(
-    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, synced_values: dict[int, int]
-) -> tuple[MockAppliance, str]:
+async def _setup_washer(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> tuple[MockAppliance, HomeConnectCoordinator, str]:
     """
-    Set up a washer and connect it the way the integration does.
+    Set up a washer that has just connected, the way the integration does it.
 
-    Same order as with a real appliance: appliance.connect() returns and the
-    coordinator reports it connected, only then the library syncs the
-    appliance's state (synced_values: uid -> raw value) and, once that is done,
-    reports the connection to the coordinator.
+    appliance.connect() has returned and the coordinator reports it connected,
+    but the library hasn't synced the appliance's state yet (see _sync).
 
     (No freezer in the tests using this: a frozen clock stalls the washer's
     background connect loop during setup.)
@@ -250,13 +249,8 @@ async def _connect_washer(
     entity_id = _entity_id(hass)
     entry: HCConfigEntry = hass.config_entries.async_entries(DOMAIN)[0]
     coordinator = entry.runtime_data.coordinator
-
-    responses = {
-        "/ro/allDescriptionChanges": [],
-        "/ro/allMandatoryValues": [{"uid": uid, "value": v} for uid, v in synced_values.items()],
-    }
-    appliance.session.send_sync.side_effect = lambda message: Mock(data=responses[message.resource])
     appliance._ext_connection_state_callback = coordinator._connection_state_callback
+    appliance._logger = Mock()
 
     appliance.session.connected = True
     coordinator.connected = True
@@ -264,10 +258,43 @@ async def _connect_washer(
     await hass.async_block_till_done()
     # The state has not arrived yet
     assert hass.states.get(entity_id).state == STATE_UNKNOWN
+    return appliance, coordinator, entity_id
 
+
+async def _sync(
+    hass: HomeAssistant, appliance: MockAppliance, synced_values: dict[int, int] | None
+) -> None:
+    """
+    Run the library's sync of the appliance state: synced_values is uid -> raw value.
+
+    None makes it fail because the connection is lost, as the library
+    reports CONNECTED to the coordinator either way.
+    """
+    if synced_values is None:
+        appliance.session.send_sync.side_effect = DisconnectedError
+        appliance.session.connected = False
+    else:
+        responses = {
+            "/ro/allDescriptionChanges": [],
+            "/ro/allMandatoryValues": [
+                {"uid": uid, "value": value} for uid, value in synced_values.items()
+            ],
+        }
+        appliance.session.send_sync.side_effect = lambda message: Mock(
+            data=responses[message.resource]
+        )
+        appliance.session.connected = True
     await appliance._connection_callback(ConnectionState.CONNECTED)
     await appliance._task_manager.block_till_done()
     await hass.async_block_till_done()
+
+
+async def _connect_washer(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, synced_values: dict[int, int]
+) -> tuple[MockAppliance, str]:
+    """Set up a washer and connect it with an appliance state of synced_values."""
+    appliance, coordinator, entity_id = await _setup_washer(hass, monkeypatch)
+    await _sync(hass, appliance, synced_values)
     assert coordinator.synced
     return appliance, entity_id
 
@@ -326,6 +353,24 @@ async def test_finish_after_first_sync_that_changed_nothing_is_recorded(
 
     await _update(hass, appliance, OPERATION_STATE, FINISHED)
     assert datetime.fromisoformat(hass.states.get(entity_id).state)
+
+
+async def test_failed_first_sync_is_not_taken_as_the_state(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sync that failed because the connection was lost leaves only the profile defaults."""
+    appliance, coordinator, entity_id = await _setup_washer(hass, monkeypatch)
+
+    await _sync(hass, appliance, None)
+    assert not coordinator.synced
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+
+    # After reconnecting, the washer turns out to have been Finished all along
+    await _sync(hass, appliance, {OPERATION_STATE_DESCRIPTION["uid"]: FINISHED})
+    assert coordinator.synced
+    assert appliance.entities[OPERATION_STATE].value == "Finished"
+    assert hass.states.get(entity_id).state == STATE_UNKNOWN
 
 
 async def test_finish_while_reconnecting_is_recorded(
