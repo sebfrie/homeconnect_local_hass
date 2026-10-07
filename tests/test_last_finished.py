@@ -12,6 +12,7 @@ from custom_components.homeconnect_ws import coordinator as coordinator_module
 from custom_components.homeconnect_ws.const import DOMAIN, LAST_FINISHED_VALUES
 from custom_components.homeconnect_ws.entity_descriptions import get_available_entities
 from custom_components.homeconnect_ws.entity_descriptions.common import generate_last_finished
+from home_disconnect import ConnectionState
 from home_disconnect.entities import Access, DeviceDescription, EntityDescription
 from home_disconnect.testutils import MockAppliance
 from homeassistant.components.sensor import SensorDeviceClass
@@ -83,6 +84,7 @@ def _mock_appliance(
     appliance.session.connected = connected
     monkeypatch.setattr(coordinator_module, "HomeAppliance", Mock(return_value=appliance))
     monkeypatch.setattr(coordinator_module.HomeConnectCoordinator, "connected", connected)
+    monkeypatch.setattr(coordinator_module.HomeConnectCoordinator, "synced", connected)
     return appliance
 
 
@@ -218,20 +220,19 @@ async def test_state_at_startup_is_not_a_finish(
     assert hass.states.get(entity_id).state == (T0 + timedelta(hours=1)).isoformat()
 
 
-async def test_first_sync_after_connecting_is_not_a_finish(
-    hass: HomeAssistant,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def _connect_washer(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, synced_values: dict[int, int]
+) -> tuple[MockAppliance, str]:
     """
-    The state delivered by the first sync is not a finish, however it differs from the profile.
+    Set up a washer and connect it the way the integration does.
 
-    Before it connects, the sensor only sees the defaults from the appliance
-    profile. A washer that was already Finished then looks like it changed
-    from Inactive to Finished, but it didn't finish just now.
+    Same order as with a real appliance: appliance.connect() returns and the
+    coordinator reports it connected, only then the library syncs the
+    appliance's state (synced_values: uid -> raw value) and, once that is done,
+    reports the connection to the coordinator.
 
-    (No freezer here: a frozen clock stalls the washer's background connect
-    loop during setup. It's enough to see the sensor go from unknown to a
-    timestamp.)
+    (No freezer in the tests using this: a frozen clock stalls the washer's
+    background connect loop during setup.)
     """
     appliance = _mock_appliance(
         monkeypatch, appliance_type="Washer", operation_state=INACTIVE, connected=False
@@ -250,14 +251,47 @@ async def test_first_sync_after_connecting_is_not_a_finish(
     entry: HCConfigEntry = hass.config_entries.async_entries(DOMAIN)[0]
     coordinator = entry.runtime_data.coordinator
 
-    # The sync arrives before the coordinator reports the connection
-    await _update(hass, appliance, OPERATION_STATE, FINISHED)
-    await _update(hass, appliance, PROGRAM_FINISHED, PRESENT)
+    responses = {
+        "/ro/allDescriptionChanges": [],
+        "/ro/allMandatoryValues": [{"uid": uid, "value": v} for uid, v in synced_values.items()],
+    }
+    appliance.session.send_sync.side_effect = lambda message: Mock(data=responses[message.resource])
+    appliance._ext_connection_state_callback = coordinator._connection_state_callback
 
     appliance.session.connected = True
     coordinator.connected = True
     coordinator.async_set_updated_data(None)
     await hass.async_block_till_done()
+    # The state has not arrived yet
+    assert hass.states.get(entity_id).state == STATE_UNKNOWN
+
+    await appliance._connection_callback(ConnectionState.CONNECTED)
+    await appliance._task_manager.block_till_done()
+    await hass.async_block_till_done()
+    assert coordinator.synced
+    return appliance, entity_id
+
+
+async def test_first_sync_after_connecting_is_not_a_finish(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The state delivered by the first sync is not a finish, however it differs from the profile.
+
+    Until it has synced, the sensor only sees the defaults from the appliance
+    profile. A washer that was already Finished then looks like it changed
+    from Inactive to Finished, but it didn't finish just now.
+    """
+    appliance, entity_id = await _connect_washer(
+        hass, monkeypatch, {OPERATION_STATE_DESCRIPTION["uid"]: FINISHED}
+    )
+    assert appliance.entities[OPERATION_STATE].value == "Finished"
+    assert hass.states.get(entity_id).state == STATE_UNKNOWN
+
+    # The same state again, or the event of the finish, are still that finish
+    await _update(hass, appliance, OPERATION_STATE, FINISHED)
+    await _update(hass, appliance, PROGRAM_FINISHED, PRESENT)
     assert hass.states.get(entity_id).state == STATE_UNKNOWN
 
     # A finish after that counts
@@ -272,27 +306,22 @@ async def test_finish_right_after_first_sync_is_recorded(
     hass: HomeAssistant,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The first change after connecting counts even if nothing else updated in between."""
-    appliance = _mock_appliance(
-        monkeypatch, appliance_type="Washer", operation_state=INACTIVE, connected=False
+    """The first change after the first sync counts even if nothing else updated in between."""
+    appliance, entity_id = await _connect_washer(
+        hass, monkeypatch, {OPERATION_STATE_DESCRIPTION["uid"]: RUN}
     )
-    washer_config = {
-        **MOCK_CONFIG_DATA,
-        CONF_DESCRIPTION: {
-            **DEVICE_DESCRIPTION,
-            "info": {**MOCK_APPLIANCE_INFO, "type": "Washer"},
-        },
-    }
-    assert await setup_config_entry(hass, washer_config)
-    entity_id = _entity_id(hass)
-    entry: HCConfigEntry = hass.config_entries.async_entries(DOMAIN)[0]
-    coordinator = entry.runtime_data.coordinator
+    assert hass.states.get(entity_id).state == STATE_UNKNOWN
 
-    await _update(hass, appliance, OPERATION_STATE, RUN)
-    appliance.session.connected = True
-    coordinator.connected = True
-    coordinator.async_set_updated_data(None)
-    await hass.async_block_till_done()
+    await _update(hass, appliance, OPERATION_STATE, FINISHED)
+    assert datetime.fromisoformat(hass.states.get(entity_id).state)
+
+
+async def test_finish_after_first_sync_that_changed_nothing_is_recorded(
+    hass: HomeAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finish counts even when the first sync brought no update for the sensor's signals."""
+    appliance, entity_id = await _connect_washer(hass, monkeypatch, {})
     assert hass.states.get(entity_id).state == STATE_UNKNOWN
 
     await _update(hass, appliance, OPERATION_STATE, FINISHED)

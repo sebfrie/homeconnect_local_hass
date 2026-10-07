@@ -390,12 +390,12 @@ class HCLastFinished(HCEntity, RestoreSensor):
 
     def _update_finished(self) -> None:
         if self._finished is None:
-            # Until connected, entities only hold the defaults from the
-            # appliance profile, which says nothing about its real state - the
-            # first update after connecting would look like a change. The
-            # coordinator reports every connection change, so this is retried
-            # from _handle_coordinator_update once the first sync is in.
-            if self._runtime_data.coordinator.connected:
+            # Until the appliance's state has been synced, entities only hold
+            # the defaults from the appliance profile, which say nothing about
+            # its real state - the first update after the sync would look like
+            # a change. The coordinator reports the sync with an update, so
+            # this is retried from _handle_coordinator_update.
+            if self._runtime_data.coordinator.synced:
                 self._finished = self._is_finished()
             return
         finished = self._is_finished()
